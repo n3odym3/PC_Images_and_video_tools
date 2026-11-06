@@ -24,152 +24,78 @@ from core.input_output_types import IOTypes
 from core.window_base import WindowBase
 
 
-class FPSCounter:
-    """
-    Moving-average FPS counter for measuring pipeline ingestion and display rates.
-    """
-
-    last_time: Optional[float]
-    raw_fps: float
-    smoothed_fps: float
-    samples: deque[float]
-    smoothing_window: int
-    call_count: int
-
-    def __init__(self, smoothing_window: int = 10) -> None:
-        """
-        Initialize the FPS counter.
-
-        Args:
-            smoothing_window: Number of samples used to compute the moving average.
-        """
-        self.last_time = None
-        self.raw_fps = 0.0
-        self.smoothed_fps = 0.0
-        self.samples = deque(maxlen=smoothing_window)
-        self.smoothing_window = smoothing_window
-        self.call_count = 0
-
-    def get_fps(self) -> Tuple[float, float]:
-        """
-        Record timestamp and compute instantaneous and smoothed FPS.
-
-        Returns:
-            Tuple of (raw_fps, smoothed_fps).
-        """
-        now = time.time()
-        if self.last_time is not None:
-            delta = now - self.last_time
-            if delta > 0:
-                self.raw_fps = 1.0 / delta
-                self.samples.append(self.raw_fps)
-                self.call_count += 1
-                if self.call_count % self.smoothing_window == 0 and len(self.samples) == self.smoothing_window:
-                    self.smoothed_fps = sum(self.samples) / self.smoothing_window
-        self.last_time = now
-        return self.raw_fps, self.smoothed_fps
-
-
-class VideoViewerWindow(WindowBase):
+class VideoViewerWin(WindowBase):
     """
     Robust and high-performance video viewer window for DearPyGui.
 
     Features:
     - Dedicated worker thread rendering to prevent UI blocking (600+ FPS capability)
     - Automatic GPU texture allocation and aspect ratio scaling
-    - Dual FPS telemetry (stream ingestion rate and actual GPU display rate)
+    - Dual FPS telemetry (stream ingestion rate and actual GPU display rate) embedded directly in the class
     - Full support for Grayscale, BGR, BGRA, and RGBA pixel formats
     - Transparent overlay support for masks and segmentation layers
     - Dynamic monitor scaling via display_scaling
     """
 
+    label: str = "Video Viewer"
+    win_width: int = display_scaling.scale(800)
+    win_height: int = display_scaling.scale(600)
     description: str = "Low-latency threaded video viewer with FPS telemetry."
 
-    texture_tag: str
-    series_tag: str
-    plot_tag: str
-    xaxis_tag: str
-    yaxis_tag: str
-    texture_registry_tag: str
-    fps_display_tag: str
-    fps_read_tag: str
+    accepted_input_types: list[type] = [
+        IOTypes.FRAME,
+        IOTypes.MASK,
+        IOTypes.FRAME_MASK_PAIR,
+    ]
+    outputs: dict[str, type] = {
+        "Frame": IOTypes.FRAME,
+        "Mask": IOTypes.MASK,
+    }
+    persistent_fields: list[str] = [
+        "label",
+        "fps_counter_enabled",
+    ]
 
-    texture_width: int
-    texture_height: int
-    _texture_initialized: bool
-    _texture_buffer: Optional[np.ndarray]
-    _thread_lock: threading.Lock
+    # Persistent field defaults
+    fps_counter_enabled: bool = True
+    texture_mode: str = "raw"
+    preserve_aspect_ratio: bool = True
 
-    fps_counter_enabled: bool
-    _running: bool
-    _is_closing: bool
-
-    latest_frame: Optional[np.ndarray]
-    frame_lock: threading.Lock
-    _update_pending: bool
-    update_event: threading.Event
-
-    display_fps_counter: FPSCounter
-    read_fps_counter: FPSCounter
-    _frame_count: int
-    _fps_update_interval: int
-    _last_source_name: Optional[str]
-
-    use_rgba: bool
-    texture_mode: str
-    _persistent_fields: List[str]
-    accepted_input_types: List[IOTypes]
-    outputs: Dict[str, IOTypes]
-    connections: Dict[str, List[Any]]
-
-    def __init__(
-        self,
-        label: str = "Video Viewer",
-        win_width: int = display_scaling.scale(800),
-        win_height: int = display_scaling.scale(600),
-        pos: Tuple[int, int] = (100, 100),
-        uuid: Optional[Union[int, str]] = None,
-        outputs: Optional[Dict[str, Any]] = None,
-        visible: bool = True,
-        fps_counter: bool = True,
-        use_rgba: bool = True,
-        **kwargs: Any,
-    ) -> None:
+    def __init__(self, **kwargs: Any) -> None:
         """
         Initialize the Video Viewer module window.
 
         Args:
-            label: Window display title.
-            win_width: Initial window width in pixels.
-            win_height: Initial window height in pixels.
-            pos: (x, y) screen placement coordinates.
-            uuid: Unique identifier for pipeline state persistence.
-            outputs: Optional custom outputs mapping.
-            visible: Whether the window starts visible.
-            fps_counter: Whether to show the FPS read/display counter bar.
-            use_rgba: Force RGBA texture format.
-            **kwargs: Extra configuration options.
+            **kwargs: Extra configuration options forwarded to WindowBase.
         """
-        self.use_rgba = True
+        super().__init__(**kwargs)
+
+        self.use_rgba: bool = True
+
+        raw_fps = getattr(self, "fps_counter_enabled", None)
+        if raw_fps is None and "fps_counter" in kwargs:
+            raw_fps = kwargs["fps_counter"]
+        self.fps_counter_enabled: bool = bool(raw_fps) if raw_fps is not None else True
 
         viewer_cfg = config.get("Viewers", {}).get("video_viewer", {})
         default_mode = viewer_cfg if isinstance(viewer_cfg, str) else viewer_cfg.get("texture_mode", "raw")
-        self.texture_mode = kwargs.get("texture_mode", default_mode).lower()
+        self.texture_mode = str(default_mode).lower() if default_mode else "raw"
         if self.texture_mode not in ("raw", "static"):
             self.texture_mode = "raw"
 
-        self._persistent_fields = ["label", "fps_counter_enabled", "texture_mode"]
+        # Aspect ratio configuration from config.json (fallback: True)
+        preserve_aspect_ratio = None
+        if isinstance(viewer_cfg, dict):
+            preserve_aspect_ratio = viewer_cfg.get("preserve_aspect_ratio")
+        if preserve_aspect_ratio is None:
+            preserve_aspect_ratio = config.get("Viewers", {}).get("preserve_aspect_ratio", True)
 
-        super().__init__(
-            label=label,
-            pos=pos,
-            win_width=win_width,
-            win_height=win_height,
-            uuid=uuid,
-            outputs=outputs or {},
-            visible=visible,
-            **kwargs,
-        )
+        if kwargs.get("stretch", False):
+            self.preserve_aspect_ratio = False
+        elif isinstance(preserve_aspect_ratio, str):
+            self.preserve_aspect_ratio = preserve_aspect_ratio.strip().lower() in ("true", "1", "yes", "preserve")
+        else:
+            self.preserve_aspect_ratio = bool(preserve_aspect_ratio)
 
         # Unique Tags for DPG items
         self.texture_tag = f"video_viewer_texture_{self.UUID}"
@@ -187,9 +113,7 @@ class VideoViewerWindow(WindowBase):
         self._texture_initialized = False
         self._texture_buffer = None
         self._thread_lock = threading.Lock()
-        self.fps_counter_enabled = fps_counter
         self._running = True
-        self._is_closing = False
         self._last_source_name = None
 
         # Threading & Latest Frame approach (no queue accumulation)
@@ -198,29 +122,94 @@ class VideoViewerWindow(WindowBase):
         self._update_pending = False
         self.update_event = threading.Event()
 
-        # FPS Counters
-        self.display_fps_counter = FPSCounter(smoothing_window=10)
-        self.read_fps_counter = FPSCounter(smoothing_window=10)
+        # FPS Telemetry Logic (Internal to VideoViewerWin)
+        self._fps_smoothing_window: int = 10
+
+        self._read_last_time: Optional[float] = None
+        self._read_raw_fps: float = 0.0
+        self._read_smoothed_fps: float = 0.0
+        self._read_samples: deque[float] = deque(maxlen=self._fps_smoothing_window)
+        self._read_call_count: int = 0
+
+        self._display_last_time: Optional[float] = None
+        self._display_raw_fps: float = 0.0
+        self._display_smoothed_fps: float = 0.0
+        self._display_samples: deque[float] = deque(maxlen=self._fps_smoothing_window)
+        self._display_call_count: int = 0
 
         # Performance optimization: frame counter for FPS display
-        self._frame_count = 0
-        self._fps_update_interval = 10
+        self._frame_count: int = 0
+        self._fps_update_interval: int = 10
 
-        # I/O Configuration
-        self.accepted_input_types = [IOTypes.FRAME, IOTypes.MASK, IOTypes.FRAME_MASK_PAIR]
-        self.outputs = {
-            "Frame": IOTypes.FRAME,
-            "Mask": IOTypes.MASK,
-        }
-        self.connections = {k: [] for k in self.outputs}
-
-        # Initialize UI
-        self._build_interface(self.win_width, self.win_height, self.pos)
+        # Initialize UI using self.window context manager
+        self._build_interface()
         self.update_permission()
 
         # Start Render Thread
-        self.worker_thread = threading.Thread(target=self._render_loop, daemon=True)
+        self.worker_thread = threading.Thread(
+            target=self._render_loop,
+            daemon=True,
+            name=f"VideoViewerWorker_{self.UUID}",
+        )
         self.worker_thread.start()
+
+    def calc_read_fps(self) -> Tuple[float, float]:
+        """
+        Record timestamp and compute instantaneous and smoothed Read FPS.
+
+        Returns:
+            Tuple of (raw_fps, smoothed_fps).
+        """
+        now = time.time()
+        if self._read_last_time is not None:
+            delta = now - self._read_last_time
+            if delta > 0:
+                self._read_raw_fps = 1.0 / delta
+                self._read_samples.append(self._read_raw_fps)
+                self._read_call_count += 1
+                if (
+                    self._read_call_count % self._fps_smoothing_window == 0
+                    and len(self._read_samples) == self._fps_smoothing_window
+                ):
+                    self._read_smoothed_fps = sum(self._read_samples) / self._fps_smoothing_window
+        self._read_last_time = now
+        return self._read_raw_fps, self._read_smoothed_fps
+
+    def calc_display_fps(self) -> Tuple[float, float]:
+        """
+        Record timestamp and compute instantaneous and smoothed Display FPS.
+
+        Returns:
+            Tuple of (raw_fps, smoothed_fps).
+        """
+        now = time.time()
+        if self._display_last_time is not None:
+            delta = now - self._display_last_time
+            if delta > 0:
+                self._display_raw_fps = 1.0 / delta
+                self._display_samples.append(self._display_raw_fps)
+                self._display_call_count += 1
+                if (
+                    self._display_call_count % self._fps_smoothing_window == 0
+                    and len(self._display_samples) == self._fps_smoothing_window
+                ):
+                    self._display_smoothed_fps = sum(self._display_samples) / self._fps_smoothing_window
+        self._display_last_time = now
+        return self._display_raw_fps, self._display_smoothed_fps
+
+    @property
+    def read_fps_counter(self) -> Any:
+        """Compatibility property providing get_fps() for Read FPS."""
+        class _ReadFPSProxy:
+            get_fps = self.calc_read_fps
+        return _ReadFPSProxy()
+
+    @property
+    def display_fps_counter(self) -> Any:
+        """Compatibility property providing get_fps() for Display FPS."""
+        class _DisplayFPSProxy:
+            get_fps = self.calc_display_fps
+        return _DisplayFPSProxy()
 
     def update_permission(self) -> None:
         """Update UI permissions based on application mode."""
@@ -249,20 +238,12 @@ class VideoViewerWindow(WindowBase):
         """Retained for backward compatibility. Viewer operates permanently in RGBA."""
         self.use_rgba = True
 
-    def _build_interface(self, width: int, height: int, pos: Tuple[int, int]) -> None:
+    def _build_interface(self) -> None:
         """Builds the initial DPG interface elements."""
         if not dpg.does_item_exist(self.texture_registry_tag):
             dpg.add_texture_registry(tag=self.texture_registry_tag, show=False)
 
-        with dpg.window(
-            label=self.label,
-            width=width,
-            height=height,
-            pos=pos,
-            tag=self.winID,
-            show=self.visible,
-            on_close=self.on_close,
-        ):
+        with self.window():
             if self.fps_counter_enabled:
                 with dpg.group(horizontal=True):
                     dpg.add_text("Read FPS: ")
@@ -291,6 +272,9 @@ class VideoViewerWindow(WindowBase):
         if self._texture_buffer is None or self._texture_buffer.size != expected_size:
             self._texture_buffer = np.zeros(expected_size, dtype=np.float32)
 
+        if frame.dtype != np.uint8:
+            frame = frame.astype(np.uint8)
+
         if len(frame.shape) == 2 or (len(frame.shape) == 3 and frame.shape[2] == 1):
             conv = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGBA)
         elif frame.shape[2] == 4:
@@ -299,9 +283,6 @@ class VideoViewerWindow(WindowBase):
             conv = cv2.cvtColor(frame, cv2.COLOR_BGR2RGBA)
         else:
             conv = frame
-
-        if conv.dtype != np.uint8:
-            conv = conv.astype(np.uint8)
 
         flat = conv.ravel()
         if len(self._texture_buffer) == len(flat):
@@ -376,7 +357,7 @@ class VideoViewerWindow(WindowBase):
                     no_title=True,
                     width=-1,
                     height=-1,
-                    equal_aspects=True,
+                    equal_aspects=self.preserve_aspect_ratio,
                     parent=self.winID,
                 )
                 dpg.add_plot_legend(parent=plot_tag)
@@ -397,6 +378,8 @@ class VideoViewerWindow(WindowBase):
                     parent=plot_tag,
                 )
                 self._apply_transparency_theme()
+            else:
+                dpg.configure_item(self.plot_tag, equal_aspects=self.preserve_aspect_ratio)
 
             dpg.add_image_series(
                 self.texture_tag,
@@ -421,12 +404,13 @@ class VideoViewerWindow(WindowBase):
         Args:
             frame: Incoming image array.
         """
-        if self.fps_counter_enabled:
-            fps = self.read_fps_counter.get_fps()
-            if dpg.does_item_exist(self.fps_read_tag):
-                dpg.set_value(self.fps_read_tag, f"{fps[1]:.1f}")
-        else:
-            self.read_fps_counter.get_fps()
+        _, smoothed_fps = self.calc_read_fps()
+        if (
+            self.fps_counter_enabled
+            and self._read_call_count % self._fps_smoothing_window == 0
+            and dpg.does_item_exist(self.fps_read_tag)
+        ):
+            dpg.set_value(self.fps_read_tag, f"{smoothed_fps:.1f}")
 
         if frame is None:
             return
@@ -522,15 +506,11 @@ class VideoViewerWindow(WindowBase):
 
         # Update FPS display only every N frames (reduce overhead)
         self._frame_count += 1
+        raw_fps, smoothed_fps = self.calc_display_fps()
         if self._frame_count >= self._fps_update_interval:
             self._frame_count = 0
             if self.fps_counter_enabled and dpg.does_item_exist(self.fps_display_tag):
-                fps = self.display_fps_counter.get_fps()
-                dpg.set_value(self.fps_display_tag, f"{fps[1]:.1f}")
-            else:
-                self.display_fps_counter.get_fps()
-        else:
-            self.display_fps_counter.get_fps()
+                dpg.set_value(self.fps_display_tag, f"{smoothed_fps:.1f}")
 
     def set_texture_mode(self, mode: str) -> None:
         """
@@ -545,6 +525,30 @@ class VideoViewerWindow(WindowBase):
                 self.texture_mode = mode_clean
                 self._texture_initialized = False
 
+    def set_preserve_aspect_ratio(self, preserve: bool) -> None:
+        """
+        Dynamically toggle aspect ratio preservation / stretching.
+
+        Args:
+            preserve: True to maintain square 1:1 pixel aspect ratio, False to stretch to fill canvas.
+        """
+        self.preserve_aspect_ratio = bool(preserve)
+
+        def _apply() -> None:
+            if dpg.does_item_exist(self.plot_tag):
+                dpg.configure_item(self.plot_tag, equal_aspects=self.preserve_aspect_ratio)
+                if dpg.does_item_exist(self.xaxis_tag) and dpg.does_item_exist(self.yaxis_tag):
+                    dpg.set_axis_limits_auto(self.xaxis_tag)
+                    dpg.set_axis_limits_auto(self.yaxis_tag)
+                    dpg.fit_axis_data(self.xaxis_tag)
+                    dpg.fit_axis_data(self.yaxis_tag)
+
+        from core.automation_manager import automation_manager
+        if threading.current_thread() is threading.main_thread():
+            _apply()
+        else:
+            automation_manager.post_to_main_thread(_apply)
+
     def on_close(self) -> None:
         """Cleanup background thread and GPU texture resources when window is closed."""
         if getattr(self, "_is_closing", False):
@@ -553,8 +557,14 @@ class VideoViewerWindow(WindowBase):
         self._running = False
         self.update_event.set()
 
-        if hasattr(self, "worker_thread") and self.worker_thread.is_alive():
+        if hasattr(self, "worker_thread") and self.worker_thread.is_alive() and threading.current_thread() != self.worker_thread:
             self.worker_thread.join(timeout=0.2)
+
+        if hasattr(self, "_plot_transparent_theme") and dpg.does_item_exist(self._plot_transparent_theme):
+            try:
+                dpg.delete_item(self._plot_transparent_theme)
+            except Exception:
+                pass
 
         with self._thread_lock:
             self._texture_initialized = False
@@ -574,6 +584,7 @@ class VideoViewerWindow(WindowBase):
                 except Exception:
                     pass
             self._texture_buffer = None
+        super().on_close()
 
     def close(self) -> None:
         """Close window and unregister."""
@@ -583,7 +594,31 @@ class VideoViewerWindow(WindowBase):
     def destroy(self) -> None:
         """Destroy window and release resources."""
         self.close()
-        super().destroy()
+
+    @staticmethod
+    def _compose_frame_with_mask(raw_frame: np.ndarray, mask: np.ndarray) -> np.ndarray:
+        """Combine a frame and a mask into a 4-channel BGRA image."""
+        h, w = raw_frame.shape[:2]
+        if mask.dtype == bool:
+            alpha = np.where(mask, np.uint8(255), np.uint8(0))
+        elif mask.dtype == np.uint8 and mask.max() > 1:
+            alpha = mask
+        elif mask.max() <= 1 and mask.dtype != np.uint8:
+            alpha = (mask * 255).astype(np.uint8)
+        else:
+            alpha = np.where(mask > 0, np.uint8(255), np.uint8(0)) if mask.dtype != np.uint8 else mask
+
+        if alpha.shape[:2] != (h, w):
+            alpha = cv2.resize(alpha, (w, h), interpolation=cv2.INTER_NEAREST)
+
+        if raw_frame.ndim == 2 or (raw_frame.ndim == 3 and raw_frame.shape[2] == 1):
+            bgra = cv2.cvtColor(raw_frame, cv2.COLOR_GRAY2BGRA)
+        elif raw_frame.shape[2] == 4:
+            bgra = raw_frame.copy()
+        else:
+            bgra = cv2.cvtColor(raw_frame, cv2.COLOR_BGR2BGRA)
+        bgra[:, :, 3] = alpha
+        return bgra
 
     def input_cb(self, *args: Any, **kwargs: Any) -> None:
         """
@@ -619,58 +654,26 @@ class VideoViewerWindow(WindowBase):
         )
 
         if is_frame_mask_pair:
-            raw_frame, mask = data[0], data[1]
-            h, w = raw_frame.shape[:2]
-            if mask.dtype == bool:
-                alpha = np.where(mask, 255, 0).astype(np.uint8)
-            elif mask.max() <= 1 and mask.dtype != np.uint8:
-                alpha = (mask * 255).astype(np.uint8)
-            else:
-                alpha = mask.astype(np.uint8)
-
-            if alpha.shape[:2] != (h, w):
-                alpha = cv2.resize(alpha, (w, h), interpolation=cv2.INTER_NEAREST)
-
-            if raw_frame.ndim == 2:
-                bgr = cv2.cvtColor(raw_frame, cv2.COLOR_GRAY2BGR)
-            elif raw_frame.shape[2] == 4:
-                bgr = raw_frame[:, :, :3]
-            else:
-                bgr = raw_frame
-
-            frame = cv2.merge([bgr[:, :, 0], bgr[:, :, 1], bgr[:, :, 2], alpha])
+            frame = self._compose_frame_with_mask(data[0], data[1])
 
         elif isinstance(data, tuple) and len(data) >= 2 and isinstance(data[1], str):
             frame = data[0]
             source_name = data[1]
             if data_type == IOTypes.MASK and isinstance(frame, np.ndarray):
                 mask = frame
-                alpha = np.where(mask > 0, 255, 0).astype(np.uint8) if mask.dtype != np.uint8 else mask
-                frame = cv2.merge([alpha, alpha, alpha, np.full_like(alpha, 255)])
+                frame = np.where(mask > 0, np.uint8(255), np.uint8(0)) if mask.dtype != np.uint8 else mask
 
         elif isinstance(data, np.ndarray):
             if data_type == IOTypes.MASK:
                 mask = data
-                alpha = np.where(mask > 0, 255, 0).astype(np.uint8) if mask.dtype != np.uint8 else mask
-                frame = cv2.merge([alpha, alpha, alpha, np.full_like(alpha, 255)])
+                frame = np.where(mask > 0, np.uint8(255), np.uint8(0)) if mask.dtype != np.uint8 else mask
             else:
                 frame = data
 
         elif isinstance(data, dict) and "frame" in data:
             frame = data["frame"]
-            if "mask" in data:
-                mask = data["mask"]
-                h, w = frame.shape[:2]
-                alpha = np.where(mask > 0, 255, 0).astype(np.uint8) if mask.dtype != np.uint8 else mask
-                if alpha.shape[:2] != (h, w):
-                    alpha = cv2.resize(alpha, (w, h), interpolation=cv2.INTER_NEAREST)
-                if frame.ndim == 2:
-                    bgr = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
-                elif frame.shape[2] == 4:
-                    bgr = frame[:, :, :3]
-                else:
-                    bgr = frame
-                frame = cv2.merge([bgr[:, :, 0], bgr[:, :, 1], bgr[:, :, 2], alpha])
+            if "mask" in data and data["mask"] is not None:
+                frame = self._compose_frame_with_mask(frame, data["mask"])
 
         if frame is None:
             return
@@ -686,7 +689,6 @@ class VideoViewerWindow(WindowBase):
         if isinstance(frame, np.ndarray):
             self.update_image(frame)
 
-
-VideoViewerWin = VideoViewerWindow
-EXPORTED_CLASS = VideoViewerWindow
+VideoViewerWindow = VideoViewerWin
+EXPORTED_CLASS = VideoViewerWin
 EXPORTED_NAME = "Video Viewer"
