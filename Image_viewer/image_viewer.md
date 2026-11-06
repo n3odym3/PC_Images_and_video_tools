@@ -22,6 +22,22 @@ The **Image Viewer** (`Image_viewer_win`) is a high-performance visual display a
 
 ---
 
+## Paramètres et Configuration (Persistent Fields)
+
+| Paramètre | Type | Valeur par défaut | Description |
+| :--- | :--- | :--- | :--- |
+| **`colorize`** | `bool` | `True` | Active la colorisation et les palettes de fausses couleurs pour les images à un canal. |
+| **`intensity_rescaling`** | `bool` | `True` | Active les commandes de recadrage d'intensité (`Auto`, `Inf`, `Sup`). |
+| **`fps_counter`** | `bool` | `True` | Active l'affichage en temps réel du compteur FPS. |
+| **`image_export`** | `bool` | `True` | Affiche la barre d'outils d'export (presse-papiers, sauvegarde disque PNG, nommage). |
+| **`image_depth`** | `str` | `"12bit"` | Interprétation de profondeur de dynamique (`8bit`, `12bit`, `16bit_norm`, `16bit_abs`). |
+| **`show_scale`** | `bool` | `True` | Affiche une barre d'échelle d'intensité graduée avec valeurs min/max. |
+| **`export_path`** | `Optional[str]` | `None` | Répertoire cible pour les sauvegardes de fichiers images. |
+| **`categories_count`** | `int` | `5` | Nombre de catégories pour l'analyse de distribution et l'exportation de palette. |
+| **`zero_as_alpha`** | `bool` | `False` | Transforme les pixels de valeur 0 en canal alpha transparent (`alpha=0`). |
+
+---
+
 ## Key Features & Controls
 
 ### 1. Colorization & Depth
@@ -56,7 +72,9 @@ The **Image Viewer** (`Image_viewer_win`) is a high-performance visual display a
 
 ### 6. Display Scaling & Aspect Ratio
 - **Proportional Scaling**: All control widths, window bounds, scale bars, and text overlays are scaled with `display_scaling.scale` to ensure crisp, readable UI across HD, 2K, and 4K displays.
-- **1:1 Square Pixel Aspect Ratio**: Employs `equal_aspects=True` on the canvas plot to prevent distortion or stretching when resizing the window.
+- **Configurable Aspect Ratio**: Configurable via `config.json` (`Viewers.image_viewer.preserve_aspect_ratio`):
+  - `true` (default): Enforces `equal_aspects=True` on the canvas plot to prevent distortion or stretching when resizing the window.
+  - `false`: Sets `equal_aspects=False`, allowing the image to stretch and fit the entire canvas.
 
 ---
 
