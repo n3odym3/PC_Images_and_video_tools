@@ -11,9 +11,11 @@ import dearpygui.dearpygui as dpg
 import numpy as np
 from loguru import logger
 
+from config.display_scaling import display_scaling
 from core.file_explorer import file_explorer
 from core.input_output_types import IOTypes
 from core.window_base import WindowBase
+from core.app_state import app_state
 from .frame_rate_scheduler import FrameRateScheduler
 from .video_writer_engine import VideoWriterEngine
 
@@ -30,84 +32,75 @@ class VideoWriter_win(WindowBase):
     - Hardware acceleration support (NVENC, QuickSync, AMF).
     """
 
-    def __init__(
-        self,
-        label: str = "Video Writer",
-        win_width: int = 340,
-        win_height: int = 420,
-        pos: Tuple[int, int] = (10, 10),
-        uuid: Optional[str] = None,
-        outputs: Optional[Dict[str, Any]] = None,
-        visible: bool = True,
-        target_fps: int = 30,
-        codec: str = VideoWriterEngine.CODEC_H264,
-        container: str = ".mp4",
-        preset: str = "veryfast",
-        bitrate_mbps: float = 8.0,
-        sync_mode: str = FrameRateScheduler.MODE_REALTIME,
-        bitdepth_mode: str = VideoWriterEngine.BITDEPTH_AUTOSCALE_8BIT,
-        output_dir: str = "",
-        folder: str = "",
-        folder_path: str = "",
-        file_prefix: str = "recording",
-        **kwargs: Any,
-    ) -> None:
-        super().__init__(
-            label=label,
-            pos=pos,
-            win_width=win_width,
-            win_height=win_height,
-            uuid=uuid,
-            outputs=outputs,
-            visible=visible,
-            **kwargs,
-        )
+    label = "Video Writer"
+    description = "High-performance video writer with real-time frame rate synchronization (Drop & Duplicate)."
+    win_width = display_scaling.scale(340)
+    win_height = display_scaling.scale(420)
 
-        # Persistent properties
-        self._persistent_fields = [
-            "label",
-            "target_fps",
-            "codec",
-            "container",
-            "preset",
-            "bitrate_mbps",
-            "sync_mode",
-            "bitdepth_mode",
-            "output_dir",
-            "file_prefix",
-        ]
+    # I/O Specifications
+    accepted_input_types = [
+        IOTypes.FRAME,
+        IOTypes.FRAME12,
+        IOTypes.FRAME16,
+        IOTypes.MASK,
+        IOTypes.FOLDER_PATH,
+        IOTypes.FILE_PATH,
+        IOTypes.TRIGGER,
+        IOTypes.CMD_DICT,
+    ]
 
-        # I/O Specifications
-        self.accepted_input_types = [
-            IOTypes.FRAME,
-            IOTypes.FRAME12,
-            IOTypes.FRAME16,
-            IOTypes.MASK,
-            IOTypes.FOLDER_PATH,
-            IOTypes.FILE_PATH,
-            IOTypes.TRIGGER,
-            IOTypes.CMD_DICT,
-        ]
+    outputs = {
+        "Frame": IOTypes.FRAME,
+        "File Path": IOTypes.FILE_PATH,
+        "Trigger": IOTypes.TRIGGER,
+        "Status": IOTypes.STATUS_DICT,
+    }
 
-        self.outputs = {
-            "Frame": IOTypes.FRAME,
-            "File Path": IOTypes.FILE_PATH,
-            "Trigger": IOTypes.TRIGGER,
-            "Status": IOTypes.STATUS_DICT,
-        }
-        self.connections = {k: [] for k in self.outputs}
+    # Persistent fields saved into pipeline JSON
+    persistent_fields = [
+        "label",
+        "target_fps",
+        "codec",
+        "container",
+        "preset",
+        "bitrate_mbps",
+        "sync_mode",
+        "bitdepth_mode",
+        "output_dir",
+        "file_prefix",
+    ]
 
-        # Configuration parameters
-        self.target_fps: int = max(1, int(target_fps))
-        self.codec: str = codec
-        self.container: str = container
-        self.preset: str = preset
-        self.bitrate_mbps: float = float(bitrate_mbps)
-        self.sync_mode: str = sync_mode
-        self.bitdepth_mode: str = bitdepth_mode
-        init_folder = output_dir or folder or folder_path or kwargs.get("output_dir", kwargs.get("folder", kwargs.get("folder_path", "")))
-        self.output_dir: str = init_folder if init_folder else os.path.join(os.path.expanduser("~"), "Videos")
-        self.file_prefix: str = file_prefix
+    # Persistent field defaults
+    target_fps: int = 30
+    codec: str = VideoWriterEngine.CODEC_H264
+    container: str = ".mp4"
+    preset: str = "veryfast"
+    bitrate_mbps: float = 8.0
+    sync_mode: str = FrameRateScheduler.MODE_REALTIME
+    bitdepth_mode: str = VideoWriterEngine.BITDEPTH_AUTOSCALE_8BIT
+    output_dir: str = ""
+    file_prefix: str = "recording"
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+
+        # Defensive extraction of persistent fields
+        try:
+            self.target_fps = max(1, int(getattr(self, "target_fps", kwargs.get("target_fps", 30)) or 30))
+        except (ValueError, TypeError):
+            self.target_fps = 30
+        self.codec = str(getattr(self, "codec", kwargs.get("codec", VideoWriterEngine.CODEC_H264)) or VideoWriterEngine.CODEC_H264)
+        self.container = str(getattr(self, "container", kwargs.get("container", ".mp4")) or ".mp4")
+        self.preset = str(getattr(self, "preset", kwargs.get("preset", "veryfast")) or "veryfast")
+        try:
+            self.bitrate_mbps = float(getattr(self, "bitrate_mbps", kwargs.get("bitrate_mbps", 8.0)) or 8.0)
+        except (ValueError, TypeError):
+            self.bitrate_mbps = 8.0
+        self.sync_mode = str(getattr(self, "sync_mode", kwargs.get("sync_mode", FrameRateScheduler.MODE_REALTIME)) or FrameRateScheduler.MODE_REALTIME)
+        self.bitdepth_mode = str(getattr(self, "bitdepth_mode", kwargs.get("bitdepth_mode", VideoWriterEngine.BITDEPTH_AUTOSCALE_8BIT)) or VideoWriterEngine.BITDEPTH_AUTOSCALE_8BIT)
+        folder_init = getattr(self, "output_dir", kwargs.get("output_dir", "")) or kwargs.get("folder", "") or kwargs.get("folder_path", "")
+        self.output_dir = str(folder_init or os.path.join(os.path.expanduser("~"), "Videos"))
+        self.file_prefix = str(getattr(self, "file_prefix", kwargs.get("file_prefix", "recording")) or "recording")
 
         # Core Engines
         self.engine = VideoWriterEngine()
@@ -117,6 +110,7 @@ class VideoWriter_win(WindowBase):
         self.frame_queue: queue.Queue = queue.Queue(maxsize=120)
         self.is_recording: bool = False
         self.is_paused: bool = False
+        self._is_closing: bool = False
         self.timed_record_duration: Optional[float] = None
         self.worker_thread: Optional[threading.Thread] = None
         self._stop_requested: threading.Event = threading.Event()
@@ -166,14 +160,8 @@ class VideoWriter_win(WindowBase):
         ]
 
         # UI Construction
-        with dpg.window(
-            label=self.label,
-            width=self.win_width,
-            height=self.win_height,
-            pos=self.pos,
-            tag=self.winID,
-            show=self.visible,
-        ):
+        scale = display_scaling.scale
+        with self.window():
             # Recording Controls Banner
             with dpg.group(horizontal=True):
                 dpg.add_button(label=" \uf04b REC ", tag=self.rec_btn_tag, callback=self.start_recording)
@@ -259,24 +247,34 @@ class VideoWriter_win(WindowBase):
                 dpg.add_text("Dropped: 0 | Duplicated: 0", tag=self.stat_drops_tag)
                 dpg.add_text("File Size: 0.00 MB", tag=self.stat_size_tag)
 
+        # Apply icon font for FontAwesome glyphs
+        try:
+            from config.theme_manager import theme_manager
+
+            theme_manager.apply_icon_font(self.rec_btn_tag)
+            theme_manager.apply_icon_font(self.pause_btn_tag)
+            theme_manager.apply_icon_font(self.stop_btn_tag)
+        except Exception as e:
+            logger.debug(f"Could not apply icon font in {self.winID}: {e}")
+
         self.update_permission()
 
     def update_permission(self) -> None:
         """Adapts UI according to application mode."""
-        from core.app_state import app_state
-
-        mode = app_state.mode
-        is_user = (mode == "user")
-
+        is_user = getattr(app_state, "mode", "dev") == "user"
         if dpg.does_item_exist(self.winID):
             dpg.configure_item(self.winID, no_close=is_user)
 
-    def _on_fps_changed(self, sender: Any, value: int, *args, **kwargs) -> None:
-        self.target_fps = max(1, int(value))
+    def _on_fps_changed(self, sender: Any = None, value: Any = None, *args: Any, **kwargs: Any) -> None:
+        try:
+            val = int(value if value is not None else (dpg.get_value(self.fps_input_tag) if dpg.does_item_exist(self.fps_input_tag) else self.target_fps))
+        except (ValueError, TypeError):
+            val = 30
+        self.target_fps = max(1, val)
         self.scheduler.target_fps = self.target_fps
         self.scheduler.slot_duration = 1.0 / self.target_fps
 
-    def _on_browse_folder(self, *args, **kwargs) -> None:
+    def _on_browse_folder(self, *args: Any, **kwargs: Any) -> None:
         file_explorer.select_folder(
             default_path=self.output_dir if os.path.isdir(self.output_dir) else "",
             callback=self._on_folder_selected,
@@ -471,9 +469,9 @@ class VideoWriter_win(WindowBase):
 
             # Check if timed recording duration has elapsed
             if self.timed_record_duration is not None:
-                stats = self.scheduler.get_stats()
-                if stats["video_duration_sec"] >= self.timed_record_duration:
-                    logger.info(f"Timed recording duration reached: {stats['video_duration_sec']:.1f}s / {self.timed_record_duration}s")
+                vid_dur = self.scheduler.frames_written / self.scheduler.target_fps
+                if vid_dur >= self.timed_record_duration:
+                    logger.info(f"Timed recording duration reached: {vid_dur:.1f}s / {self.timed_record_duration}s")
                     break
 
         # Process any remaining frames in queue before finishing
@@ -533,7 +531,24 @@ class VideoWriter_win(WindowBase):
             dpg.set_value(self.stat_size_tag, f"File Size: {file_size_mb:.2f} MB")
 
         # Emit status dictionary to downstream connections
-        self._emit_status({**stats, "file_size_mb": file_size_mb, "is_recording": self.is_recording})
+        if self.connections.get("Status"):
+            self._emit_status({**stats, "file_size_mb": file_size_mb, "is_recording": self.is_recording})
+
+    def _enqueue_and_emit_frame(self, frame: np.ndarray, metadata: Any = None) -> None:
+        """Pass-through frame downstream and enqueue for background video recording."""
+        self._emit_frame(frame, metadata)
+        if self.is_recording and not self.is_paused:
+            ts = time.perf_counter()
+            try:
+                # Fast non-blocking push (< 0.05ms)
+                self.frame_queue.put_nowait((frame, ts, metadata))
+            except queue.Full:
+                # If buffer is congested, drop oldest frame to prevent RAM bloat
+                try:
+                    self.frame_queue.get_nowait()
+                except queue.Empty:
+                    pass
+                self.frame_queue.put_nowait((frame, ts, metadata))
 
     def input_cb(self, *args: Any, **kwargs: Any) -> None:
         """
@@ -541,7 +556,6 @@ class VideoWriter_win(WindowBase):
         Non-blocking ingestion into thread-safe frame queue with passthrough output.
         """
         data = kwargs.get("data") if kwargs.get("data") is not None else (args[0] if args else None)
-        data_type = kwargs.get("data_type")
 
         # Direct keyword arguments for folder or folder_path
         direct_folder = kwargs.get("folder_path") or kwargs.get("folder") or kwargs.get("output_dir") or kwargs.get("path")
@@ -549,11 +563,24 @@ class VideoWriter_win(WindowBase):
             if self.set_output_dir(direct_folder):
                 return
 
+        # Fast-path for incoming frames (most frequent call path)
+        if isinstance(data, np.ndarray):
+            self._enqueue_and_emit_frame(data, None)
+            return
+        if isinstance(data, tuple) and len(data) >= 2 and isinstance(data[0], np.ndarray):
+            self._enqueue_and_emit_frame(data[0], data[1])
+            return
+
+        data_type = kwargs.get("data_type")
+
         # 1. Handle commands
         if isinstance(data, dict) or data_type == IOTypes.CMD_DICT:
+            if isinstance(data, dict) and "image" in data and isinstance(data["image"], np.ndarray):
+                self._enqueue_and_emit_frame(data["image"], data.get("filename"))
+                return
             cmd = data if isinstance(data, dict) else {}
-            if "prefix" in cmd or "group" in cmd or "name" in cmd:
-                prefix_val = cmd.get("prefix") or cmd.get("group") or cmd.get("name")
+            if "prefix" in cmd or "group" in cmd or "name" in cmd or "animation" in cmd:
+                prefix_val = cmd.get("prefix") or cmd.get("group") or cmd.get("name") or cmd.get("animation")
                 if prefix_val:
                     self.file_prefix = str(prefix_val)
                     if dpg.does_item_exist(self.prefix_input_tag):
@@ -563,16 +590,30 @@ class VideoWriter_win(WindowBase):
             if cmd_folder and isinstance(cmd_folder, str):
                 self.set_output_dir(cmd_folder)
 
-            if cmd.get("start") or cmd.get("record_video") or ("duration" in cmd and cmd.get("record")):
+            ev = str(cmd.get("event", "")).upper()
+            if cmd.get("start") or cmd.get("record_video") or ev in ("START", "RECORD", "RECORD_START") or ("duration" in cmd and cmd.get("record")):
                 dur = cmd.get("duration") or cmd.get("record_for") or cmd.get("time")
                 self.start_recording(duration=dur)
-            elif cmd.get("stop") or cmd.get("stop_video"):
+            elif cmd.get("stop") or cmd.get("stop_video") or ev in ("STOP", "RECORD_STOP"):
                 self.stop_recording()
-            elif cmd.get("pause"):
+            elif cmd.get("pause") or ev == "PAUSE":
                 self.toggle_pause()
             elif "fps" in cmd:
                 self._on_fps_changed(None, cmd["fps"])
             return
+
+        # 1.5 Handle Trigger signals (e.g. START, STOP, RECORD)
+        if data_type == IOTypes.TRIGGER or (isinstance(data, str) and data.upper() in ("START", "STOP", "RECORD", "RECORD_START", "RECORD_STOP", "PAUSE")):
+            ev = str(data).strip().upper()
+            if ev in ("START", "RECORD", "RECORD_START"):
+                self.start_recording()
+                return
+            elif ev in ("STOP", "RECORD_STOP"):
+                self.stop_recording()
+                return
+            elif ev == "PAUSE":
+                self.toggle_pause()
+                return
 
         # 2. Handle folder path
         if data_type == IOTypes.FOLDER_PATH:
@@ -598,41 +639,13 @@ class VideoWriter_win(WindowBase):
                 if self.set_output_dir(data[0]):
                     return
 
-        # 3. Handle incoming frame payload
-        frame = None
-        metadata = None
-
-        if isinstance(data, tuple) and len(data) >= 2 and isinstance(data[0], np.ndarray):
-            frame = data[0]
-            metadata = data[1]
-        elif isinstance(data, np.ndarray):
-            frame = data
-        elif isinstance(data, dict) and "image" in data and isinstance(data["image"], np.ndarray):
-            frame = data["image"]
-            metadata = data.get("filename")
-
-        if frame is not None:
-            # Re-emit frame downstream (Pass-through functionality)
-            self._emit_frame(frame, metadata)
-
-            # If recording active, push to worker queue
-            if self.is_recording and not self.is_paused:
-                ts = time.perf_counter()
-                try:
-                    # Fast non-blocking push (< 0.05ms)
-                    self.frame_queue.put_nowait((frame, ts, metadata))
-                except queue.Full:
-                    # If buffer is congested, drop oldest frame to prevent RAM bloat
-                    try:
-                        self.frame_queue.get_nowait()
-                    except queue.Empty:
-                        pass
-                    self.frame_queue.put_nowait((frame, ts, metadata))
-
     def _emit_frame(self, frame: np.ndarray, metadata: Any = None) -> None:
         """Re-emits incoming frame downstream to connected modules (Pass-through)."""
+        targets = self.connections.get("Frame")
+        if not targets:
+            return
         payload = (frame, metadata) if metadata is not None else frame
-        for module in self.connections.get("Frame", []):
+        for module in targets:
             try:
                 module.input_cb(data=payload, data_type=IOTypes.FRAME)
             except Exception as e:
@@ -664,10 +677,29 @@ class VideoWriter_win(WindowBase):
             except Exception as e:
                 pass
 
+    def is_ready(self) -> bool:
+        """Indicate whether the video writer module is ready."""
+        return True
+
     def on_close(self) -> None:
         """Clean resource release upon window closure."""
+        if getattr(self, "_is_closing", False):
+            return
+        self._is_closing = True
         self.stop_recording()
+        super().on_close()
+
+    def close(self) -> None:
+        """Close window and unregister."""
+        self.on_close()
+        super().close()
+
+    def destroy(self) -> None:
+        """Destroy window and release resources."""
+        self.close()
+        super().destroy()
 
 
+VideoWriterWin = VideoWriter_win
 EXPORTED_CLASS = VideoWriter_win
 EXPORTED_NAME = "Video Writer"

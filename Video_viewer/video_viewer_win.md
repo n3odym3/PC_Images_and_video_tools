@@ -16,6 +16,17 @@ The **Video Viewer** (`VideoViewerWindow`) is a high-performance, low-latency vi
 
 ---
 
+## Paramètres et Configuration (Persistent Fields)
+
+| Paramètre | Type | Valeur par défaut | Description |
+| :--- | :--- | :--- | :--- |
+| **`label`** | `str` | `"Video Viewer"` | Titre de la fenêtre du visualisateur vidéo. |
+| **`fps_counter_enabled`** | `bool` | `True` | Active l'affichage en temps réel de la télémétrie FPS (*Read FPS* et *Display FPS*). |
+| **`texture_mode`** | `str` | `"raw"` | Mode de texture GPU (`"raw"` pour accès mémoire direct haute vitesse, ou `"static"` en repli). |
+| **`preserve_aspect_ratio`** | `bool` | `True` | Maintient le ratio d'aspect 1:1 pixel carré ou autorise l'étirement sur le canevas. |
+
+---
+
 ## Key Features & Architecture
 
 ### 1. Non-Blocking Render Loop (600+ FPS)
@@ -36,7 +47,9 @@ The **Video Viewer** (`VideoViewerWindow`) is a high-performance, low-latency vi
 
 ### 4. Display Scaling & Aspect Ratio Preservation
 - Integrates `display_scaling.scale` for initial window bounds (`800x600` scaled) and toolbar spacing.
-- Enforces `equal_aspects=True` on the canvas plot, ensuring 1:1 square pixel aspect ratio without distortion regardless of window dimensions.
+- Configurable aspect ratio behavior via `config.json` (`Viewers.video_viewer.preserve_aspect_ratio`):
+  - `true` (default): Enforces `equal_aspects=True` on the canvas plot, ensuring 1:1 square pixel aspect ratio without distortion.
+  - `false`: Sets `equal_aspects=False`, allowing the video frame to stretch and fit the entire canvas.
 
 ### 5. Raw vs Static GPU Textures
 - Configurable via `config.json` (`Viewers.video_viewer.texture_mode`):

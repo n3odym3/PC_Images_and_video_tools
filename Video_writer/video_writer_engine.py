@@ -52,6 +52,8 @@ class VideoWriterEngine:
     CODEC_FFV1 = "FFV1 (Lossless Scientific Archival)"
     CODEC_OPENCV_MP4V = "OpenCV MP4V"
 
+    _FFMPEG_AVAILABLE: Optional[bool] = None
+
     def __init__(self) -> None:
         """Initialize encoder backend references and configuration state."""
         self.is_open: bool = False
@@ -76,11 +78,15 @@ class VideoWriterEngine:
         self.hardware_accel: bool = False
         self.input_pix_fmt: str = "bgr24"
         self._uint16_shift: Optional[int] = None
+        self._last_raw_frame_ref: Optional[np.ndarray] = None
+        self._last_prepared_frame: Optional[np.ndarray] = None
 
     @staticmethod
     def is_ffmpeg_installed() -> bool:
         """Check if FFmpeg executable is present in PATH."""
-        return shutil.which("ffmpeg") is not None
+        if VideoWriterEngine._FFMPEG_AVAILABLE is None:
+            VideoWriterEngine._FFMPEG_AVAILABLE = shutil.which("ffmpeg") is not None
+        return VideoWriterEngine._FFMPEG_AVAILABLE
 
     @staticmethod
     def is_vidgear_installed() -> bool:
@@ -130,6 +136,8 @@ class VideoWriterEngine:
         self.bitdepth_mode = bitdepth_mode
         self.hardware_accel = hardware_accel
         self._uint16_shift = None
+        self._last_raw_frame_ref = None
+        self._last_prepared_frame = None
 
         # Ensure target directory exists
         out_dir = os.path.dirname(filepath)
@@ -250,8 +258,6 @@ class VideoWriterEngine:
                 in_pix_fmt = "gray16le" if channels == 1 else "bgr48le"
             elif channels == 1:
                 in_pix_fmt = "gray"
-            elif channels == 4:
-                in_pix_fmt = "bgra"
             else:
                 in_pix_fmt = "bgr24"
 
@@ -458,12 +464,12 @@ class VideoWriterEngine:
                     logger.error(f"FFmpeg process died unexpectedly: {err_summary}")
                     return False
                 if self._ffmpeg_proc.stdin:
-                    self._ffmpeg_proc.stdin.write(processed_frame.tobytes())
+                    self._ffmpeg_proc.stdin.write(memoryview(np.ascontiguousarray(processed_frame)))
                 return True
 
             elif self.backend_type == "opencv" and self._cv2_writer is not None:
                 if processed_frame.dtype != np.uint8:
-                    processed_frame = (processed_frame >> 8).astype(np.uint8)
+                    processed_frame = cv2.convertScaleAbs(processed_frame, alpha=1.0 / 256.0)
                 self._cv2_writer.write(processed_frame)
                 return True
 
@@ -482,6 +488,10 @@ class VideoWriterEngine:
         Returns:
             Preprocessed NumPy array ready for encoder consumption.
         """
+        if frame is self._last_raw_frame_ref and self._last_prepared_frame is not None:
+            return self._last_prepared_frame
+
+        raw_ref = frame
         h, w = frame.shape[:2]
         if w != self.width or h != self.height:
             frame = cv2.resize(frame, (self.width, self.height), interpolation=cv2.INTER_AREA)
@@ -496,8 +506,10 @@ class VideoWriterEngine:
                     max_val = np.max(frame) if frame.size > 0 else 0
                     shift = 4 if max_val <= 4095 else 8
                     self._uint16_shift = shift
-                frame = (frame >> shift).astype(np.uint8)
+                frame = cv2.convertScaleAbs(frame, alpha=1.0 / (1 << shift))
             else:
+                self._last_raw_frame_ref = raw_ref
+                self._last_prepared_frame = frame
                 return frame
 
         # 2. Channel normalization for 8-bit
@@ -525,6 +537,8 @@ class VideoWriterEngine:
                 ):
                     frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
 
+        self._last_raw_frame_ref = raw_ref
+        self._last_prepared_frame = frame
         return frame
 
     def close(self) -> None:
@@ -570,6 +584,8 @@ class VideoWriterEngine:
             self.is_open = False
             self.backend_type = "none"
             self._uint16_shift = None
+            self._last_raw_frame_ref = None
+            self._last_prepared_frame = None
 
     def get_file_size_mb(self) -> float:
         """
