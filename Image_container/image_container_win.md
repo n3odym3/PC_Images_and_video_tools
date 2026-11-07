@@ -66,6 +66,3 @@ The **Image Container** module manages, caches, filters, and replays experimenta
 - **`update_permission()`**: Disables administrative and editing controls in user mode (`app_state.mode == "user"`), while locking the window close button (`no_close=True`).
 - **`on_close()`**: Halts playback thread, stops ROI background worker, and cleans up memory cache. Guarded by `_is_closing`.
 - **`close()` / `destroy()`**: Unregisters window and cleans up tag tree.
-
----
-

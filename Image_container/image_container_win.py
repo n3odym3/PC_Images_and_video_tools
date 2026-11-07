@@ -9,6 +9,7 @@ import os
 import sys
 import cv2
 import threading
+from concurrent.futures import ThreadPoolExecutor
 import time
 import numpy as np
 import re
@@ -56,7 +57,7 @@ class ImageContainerWin(WindowBase):
     timestamp_check_tag: str
     browse_btn_tag: str
     handler_registry_tag: str
-    _persistent_fields: list[str]
+    persistent_fields: list[str]
     accepted_input_types: list[IOTypes]
     name_queue: list[str]
     roi_queue: queue.Queue
@@ -144,7 +145,7 @@ class ImageContainerWin(WindowBase):
         self.timestamp_check_tag = f"ic_timestamp_check_{self.UUID}"
         
         # Module Configuration
-        self._persistent_fields = ["label", "folder_path"]
+        self.persistent_fields = ["label", "folder_path"]
         self.accepted_input_types = [IOTypes.FOLDER_PATH, IOTypes.FRAME, IOTypes.FRAME12, IOTypes.FRAME16, IOTypes.ROI_SAMPLE, IOTypes.CMD_DICT] 
         
         # Load config.json
@@ -176,7 +177,8 @@ class ImageContainerWin(WindowBase):
     def update_permission(self) -> None:
         """
         Adapt UI based on app_state.mode.
-        In 'user' mode: hide export, import, play, stop, fps, record, save, timestamp, and disable all inputs.
+        In 'user' mode: hide play, stop, fps, record, save, timestamp, and disable unneeded inputs.
+        Export and import remain functional and visible.
         """
         from core.app_state import app_state
 
@@ -185,8 +187,6 @@ class ImageContainerWin(WindowBase):
 
         # Elements to disable and hide
         hidden_elements = [
-            self.btn_export_tag,
-            self.btn_import_tag,
             self.play_btn,
             self.stop_btn,
             self.fps_drag_tag,
@@ -208,6 +208,11 @@ class ImageContainerWin(WindowBase):
                     dpg.show_item(tag)
                     dpg.configure_item(tag, enabled=True)
 
+        for tag in [self.btn_export_tag, self.btn_import_tag]:
+            if dpg.does_item_exist(tag):
+                dpg.show_item(tag)
+                dpg.configure_item(tag, enabled=True)
+
         if dpg.does_item_exist(self.winID):
             dpg.configure_item(self.winID, no_close=is_user)
 
@@ -215,9 +220,9 @@ class ImageContainerWin(WindowBase):
         with dpg.window(label=self.label, width=width, height=height, pos=self.pos, tag=self.winID, show=self.visible):
 
             with dpg.group(horizontal=True):
-                dpg.add_button(label="Browse", tag=self.browse_btn_tag, width=display_scaling.scale(70), callback=self._on_browse_clicked)
-                dpg.add_button(label="Export", tag=self.btn_export_tag, width=display_scaling.scale(70), callback=self._export_experiment_to_file)
-                dpg.add_button(label="Import", tag=self.btn_import_tag, width=display_scaling.scale(70), callback=self._import_experiment_from_file)
+                dpg.add_button(label="Browse", tag=self.browse_btn_tag, width=display_scaling.scale(100), callback=self._on_browse_clicked)
+                dpg.add_button(label="Export", tag=self.btn_export_tag, width=display_scaling.scale(100), callback=self._export_experiment_to_file)
+                dpg.add_button(label="Import", tag=self.btn_import_tag, width=display_scaling.scale(100), callback=self._import_experiment_from_file)
 
             dpg.add_separator()
 
@@ -249,7 +254,7 @@ class ImageContainerWin(WindowBase):
                 dpg.add_checkbox(label="Save", tag=self.save_check_tag, default_value=False)
                 dpg.add_checkbox(label="Timestamp", tag=self.timestamp_check_tag, default_value=False)
 
-            dpg.add_combo(["Index", "Time", "Intensity"], default_value="Time", label="X-Axis", tag=self.x_axis_combo_tag, width=display_scaling.scale(120))
+            dpg.add_combo(["Index", "Time", "Intensity"], default_value="Time", label="X-Axis", tag=self.x_axis_combo_tag, callback=self._on_x_axis_changed, width=display_scaling.scale(120))
 
             with dpg.group(horizontal=True):
                 dpg.add_text("0 images", tag=self.count_text_tag)
@@ -305,13 +310,19 @@ class ImageContainerWin(WindowBase):
         if selected_dir:
             self.input_cb(data=selected_dir)
 
-    def _get_x_value(self, filename: str, index: int) -> float:
+    def _get_x_value(self, filename: str, index: int, mode: str | None = None) -> float:
         """
         Determines the X val based on selected mode.
-        If 'Time (from name)', parses last number after '_'.
+        If 'Time', parses last number after '_'.
+        If 'Intensity', checks metadata for 'A' value or extracts A[val].
         Else returns index.
         """
-        mode = dpg.get_value(f"ic_xaxis_combo_{self.UUID}")
+        if mode is None:
+            if dpg.does_item_exist(self.x_axis_combo_tag):
+                mode = dpg.get_value(self.x_axis_combo_tag)
+            else:
+                mode = "Time"
+
         if mode == "Time":
             try:
                 name_no_ext = os.path.splitext(filename)[0]
@@ -324,18 +335,81 @@ class ImageContainerWin(WindowBase):
             try:
                 # Check metadata for 'A' value, fallback to 0
                 meta = self.metadata_cache.get(filename, {})
-                if 'A' in meta:
+                if 'A' in meta and meta['A'] is not None:
                     return float(meta['A'])
                 # Also try to extract it from the path just in case metadata isn't ready
                 name_no_ext = os.path.splitext(filename)[0]
-                a_match = re.search(r'[_\-]A(\d+)(?:[_\-]|$)', f"_{name_no_ext}_")
+                a_match = re.search(r'[_\-]A(\d+(?:\.\d+)?)(?:[_\-]|$)', f"_{name_no_ext}_")
                 if a_match:
                     return float(a_match.group(1))
                 return 0.0 # Default to 0 instead of index for intensity to keep scales consistent
             except Exception:
                 pass
-                
+
         return float(index)
+
+    def _on_x_axis_changed(self, sender: Any = None, app_data: Any = None, user_data: Any = None, *args: Any) -> None:
+        """
+        Callback triggered when X-Axis mode is changed (Index / Time / Intensity).
+        Recalculates the X values for all currently active and cached ROIs and re-emits them.
+        Also updates the position marker of the selected image.
+        """
+        mode = app_data if app_data else dpg.get_value(self.x_axis_combo_tag)
+        if not mode:
+            return
+
+        logger.info(f"ImageContainer: X-Axis mode changed to '{mode}'. Recalculating X scales for all ROIs...")
+
+        # Recalculate and re-emit active ROIs
+        for roi_uuid, roi_data in list(self.active_rois.items()):
+            labels = roi_data.get("labels", [])
+            new_x = [
+                self._get_x_value(fname, self.current_list.index(fname) if fname in self.current_list else i, mode=mode)
+                for i, fname in enumerate(labels)
+            ]
+            roi_data["x"] = new_x
+            if roi_uuid in self._roi_cache:
+                self._roi_cache[roi_uuid]["x"] = new_x
+
+            sample = roi_data.get("sample", {})
+            out_sample = {
+                "uuid":   roi_uuid,
+                "name":   sample.get("name", "ROI"),
+                "x":      new_x,
+                "y":      roi_data.get("y", []),
+                "labels": labels,
+                "action": "select",
+            }
+            self._emit_sample(out_sample)
+
+            prepared = roi_data.get("prepared")
+            if prepared:
+                self._emit_cropped_images(sample, prepared, new_x, labels)
+
+        # Update any cached ROIs that might not be currently active
+        for roi_uuid, cached in self._roi_cache.items():
+            if roi_uuid not in self.active_rois:
+                labels = cached.get("labels", [])
+                new_x = [
+                    self._get_x_value(fname, self.current_list.index(fname) if fname in self.current_list else i, mode=mode)
+                    for i, fname in enumerate(labels)
+                ]
+                cached["x"] = new_x
+
+        # Re-emit current position marker if an image is selected
+        if dpg.does_item_exist(self.listbox_tag):
+            selected_img = dpg.get_value(self.listbox_tag)
+            if selected_img and selected_img in self.current_list:
+                idx = self.current_list.index(selected_img)
+                x_val = self._get_x_value(selected_img, idx, mode=mode)
+                self._emit_cmd({"action": "position", "value": x_val})
+                pos_payload = {"action": "position", "value": x_val}
+                for module in self.connections.get("Result", []):
+                    if hasattr(module, "input_cb"):
+                        try:
+                            module.input_cb(data=pos_payload, data_type=IOTypes.CMD_DICT)
+                        except Exception as e:
+                            logger.error(f"Error sending updated position to Result connection: {e}")
 
     def input_cb(self, data: Any = None, *args: Any, **kwargs: Any) -> None:
         """
@@ -350,6 +424,7 @@ class ImageContainerWin(WindowBase):
             
             if sample.get("clear"):
                 self.active_rois = {}
+                self._roi_cache = {}
                 return
 
             action = sample.get("action")
@@ -412,6 +487,12 @@ class ImageContainerWin(WindowBase):
             # if cmd.get("export", False):
             #     self._export_experiment_to_file()
             
+            if "xaxis" in cmd or "x_axis" in cmd:
+                val = cmd.get("xaxis") or cmd.get("x_axis")
+                if val in ["Index", "Time", "Intensity"]:
+                    dpg.set_value(self.x_axis_combo_tag, val)
+                    self._on_x_axis_changed(app_data=val)
+
             if "import_experiment" in cmd:
                 self._import_experiment(cmd["import_experiment"])
 
@@ -516,7 +597,10 @@ class ImageContainerWin(WindowBase):
                             os.makedirs(self.folder_path, exist_ok=True)
                             save_name = name if name.lower().endswith('.png') else f"{name}.png"
                             save_path = os.path.join(self.folder_path, save_name)
-                            cv2.imwrite(save_path, img)
+                            ext = os.path.splitext(save_name)[1] or ".png"
+                            success, buf = cv2.imencode(ext, img)
+                            if success:
+                                buf.tofile(save_path)
                             logger.debug(f"Saved image to {save_path}")
                         except Exception as e:
                             logger.error(f"Failed to save image: {e}")
@@ -778,13 +862,38 @@ class ImageContainerWin(WindowBase):
             cached_rect = cached["sample"].get("rect")
             req_rect = roi_sample.get("rect")
             if cached.get("list_len") == len(self.current_list) and cached_rect == req_rect:
+                # Recalculate x_data in case the X-axis mode changed since caching
+                labels = cached.get("labels", [])
+                x_data = [
+                    self._get_x_value(fname, self.current_list.index(fname) if fname in self.current_list else i)
+                    for i, fname in enumerate(labels)
+                ]
+                cached["x"] = x_data
                 self.active_rois[roi_uuid] = cached
+
+                effective_sample = dict(cached.get("sample", {}))
+                effective_sample.update(roi_sample)
+                if not effective_sample.get("name"):
+                    effective_sample["name"] = cached.get("sample", {}).get("name", "ROI")
+
+                # ── Emit cropped ROI images if a downstream module is connected ──
+                prepared = cached.get("prepared")
+                if prepared is None:
+                    roi_mask = effective_sample.get("mask")
+                    if roi_mask is not None and isinstance(roi_mask, np.ndarray):
+                        prepared = self._prepare_roi_mask(roi_mask)
+                    else:
+                        prepared = self._prepare_roi_rect(effective_sample)
+                    cached["prepared"] = prepared
+
+                self._emit_cropped_images(effective_sample, prepared, x_data, labels)
+
                 out_sample = {
                     "uuid":   roi_uuid,
-                    "name":   roi_sample.get("name", cached["sample"].get("name")),
-                    "x":      cached["x"],
+                    "name":   effective_sample.get("name"),
+                    "x":      x_data,
                     "y":      cached["y"],
-                    "labels": cached["labels"],
+                    "labels": labels,
                     "action": "select" 
                 }
                 self._emit_sample(out_sample)
@@ -1056,23 +1165,30 @@ class ImageContainerWin(WindowBase):
             return
         
         total = len(files)
-        logger.info(f"Loading {total} images from {self.folder_path}...")
-        
-        for i, f in enumerate(files):
-            path = os.path.join(self.folder_path, f)
+        folder = self.folder_path
+        logger.info(f"Loading {total} images from {folder}...")
+
+        def _load_single(f: str) -> tuple[str, np.ndarray | None]:
+            path = os.path.join(folder, f)
             try:
-                # Load image
-                img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+                raw_bytes = np.fromfile(path, dtype=np.uint8)
+                if raw_bytes.size == 0:
+                    return f, None
+                return f, cv2.imdecode(raw_bytes, cv2.IMREAD_UNCHANGED)
+            except Exception as e:
+                logger.warning(f"Failed to load {f}: {e}")
+                return f, None
+
+        with ThreadPoolExecutor() as executor:
+            for i, (f, img) in enumerate(executor.map(_load_single, files)):
                 if img is not None:
                     self.image_cache[f] = img
                     # Parse metadata
                     self._parse_metadata(f)
-            except Exception as e:
-                logger.warning(f"Failed to load {f}: {e}")
-                
-            if i % 5 == 0:
-                progress = i / total
-                self._update_progress(progress, f"Loading {i}/{total}")
+
+                if i % 5 == 0:
+                    progress = i / total
+                    self._update_progress(progress, f"Loading {i}/{total}")
 
         self._update_list_ui()
         logger.success(f"Added {len(files)} images. Total: {len(self.image_cache)}")
@@ -1108,9 +1224,10 @@ class ImageContainerWin(WindowBase):
                         meta['group'] = raw_group
                         
                 # Extract A value via Regex: looks for _A123_ or -A123. or 0_A123
-                a_match = re.search(r'[_\-]A(\d+)(?:[_\-]|$)', f"_{name_no_ext}_")
+                a_match = re.search(r'[_\-]A(\d+(?:\.\d+)?)(?:[_\-]|$)', f"_{name_no_ext}_")
                 if a_match:
-                    meta['A'] = int(a_match.group(1))
+                    val_str = a_match.group(1)
+                    meta['A'] = float(val_str) if '.' in val_str else int(val_str)
                     
         except Exception:
             pass
@@ -1362,18 +1479,29 @@ class ImageContainerWin(WindowBase):
                     else:
                         rois = metadata_payload.get("rois", [])
 
-                    for original_name, archive_name in archive_map.items():
-                        normalized = archive_name.replace('\\', '/')
-                        if normalized not in names:
-                            logger.warning(f"Archive entry {archive_name} missing for image {original_name}")
-                            continue
-                        data = z.read(normalized)
+                    def _iter_zip_entries():
+                        for original_name, archive_name in archive_map.items():
+                            normalized = archive_name.replace('\\', '/')
+                            if normalized not in names:
+                                logger.warning(f"Archive entry {archive_name} missing for image {original_name}")
+                                continue
+                            yield original_name, normalized, z.read(normalized)
+
+                    def _decode_zip_entry(entry: tuple[str, str, bytes]) -> tuple[str, str, np.ndarray | None]:
+                        original_name, normalized, data = entry
                         nparr = np.frombuffer(data, np.uint8)
                         img = cv2.imdecode(nparr, cv2.IMREAD_UNCHANGED)
-                        if img is None:
-                            logger.warning(f"Failed to decode image {original_name} from archive entry {normalized}")
-                            continue
-                        images[original_name] = img
+                        return original_name, normalized, img
+
+                    total_zip = max(1, len(archive_map))
+                    with ThreadPoolExecutor() as executor:
+                        for i, (original_name, normalized, img) in enumerate(executor.map(_decode_zip_entry, _iter_zip_entries())):
+                            if img is None:
+                                logger.warning(f"Failed to decode image {original_name} from archive entry {normalized}")
+                                continue
+                            images[original_name] = img
+                            if i % 10 == 0:
+                                self._update_progress(i / total_zip, f"Extracting {i}/{total_zip}")
 
                     if not images:
                         raise ValueError("Archive contains no images")
@@ -1440,6 +1568,22 @@ class ImageContainerWin(WindowBase):
         should_emit_fo_fm = False
         # If the combo box triggered this, emit the group change/clear command
         if sender == self.group_combo_tag and selected_group:
+            from core.app_state import app_state
+            if selected_group != "All" and self.folder_path:
+                json_path = os.path.join(self.folder_path, f"{selected_group}.json")
+                if not os.path.exists(json_path) and selected_group.startswith("G"):
+                    json_path = os.path.join(self.folder_path, f"{selected_group[1:]}.json")
+                if os.path.exists(json_path):
+                    try:
+                        with open(json_path, "r") as f:
+                            data = json.load(f)
+                            app_state.detector = data.get("detector", None)
+                    except Exception:
+                        app_state.detector = None
+                else:
+                    app_state.detector = None
+            else:
+                app_state.detector = None
             # Reload config dynamically
             config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
             if os.path.exists(config_path):
@@ -1508,7 +1652,7 @@ class ImageContainerWin(WindowBase):
                 threading.Timer(0.1, select_second).start()
                 logger.info(f"Auto-selected first two images of group '{selected_group}': {self.current_list[0]} and {self.current_list[1]}")
 
-    def _on_list_select(self, sender: Any, app_data: Any, user_data: Any = None, *args: Any) -> None:
+    def _on_list_select(self, sender: Any, app_data: Any, user_data: Any = None, *args: Any, idx: int | None = None) -> None:
         if not app_data: 
             logger.warning("No app_data received in _on_list_select")
             return
@@ -1535,8 +1679,10 @@ class ImageContainerWin(WindowBase):
                     logger.error(f"Error sending image name to {module.label}: {e}")
             
             # Emit position (index in current list) via CMD output
-            if app_data in self.current_list:
-                idx = self.current_list.index(app_data)
+            if idx is None or not (0 <= idx < len(self.current_list) and self.current_list[idx] == app_data):
+                idx = self.current_list.index(app_data) if app_data in self.current_list else None
+
+            if idx is not None:
                 x_val = self._get_x_value(app_data, idx)
                 self._emit_cmd({"action": "position", "value": x_val})
                 
@@ -1562,30 +1708,28 @@ class ImageContainerWin(WindowBase):
         self.stop_playback_flag = False
         
         def playback_task() -> None:
-            fps = dpg.get_value(self.fps_drag_tag)
-            if fps <= 0: fps = 1
-            delay = 1.0 / fps
-            
             # Start from ZERO (beginning)
             start_index = 0
                 
             for i in range(start_index, len(self.current_list)):
-                if self.stop_playback_flag:
+                if self.stop_playback_flag or i >= len(self.current_list):
                     break
                 
+                t0 = time.perf_counter()
                 filename = self.current_list[i]
                 
                 # Update UI selection
                 dpg.set_value(self.listbox_tag, filename)
                 
                 # Send Data
-                self._on_list_select(None, filename)
+                self._on_list_select(None, filename, idx=i)
                 
-                # Dynamic FPS update
+                # Dynamic FPS update, compensating for frame processing time
                 fps = dpg.get_value(self.fps_drag_tag)
                 delay = 1.0 / max(1, fps)
-                
-                time.sleep(delay)
+                remaining = delay - (time.perf_counter() - t0)
+                if remaining > 0:
+                    time.sleep(remaining)
             
             self.playback_active = False
 
